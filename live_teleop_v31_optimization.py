@@ -32,9 +32,9 @@ from projectaria_tools.core.calibration import (
 CHECKPOINT_PATH = "ckpts/hamba/checkpoints/hamba.ckpt"
 # ARIA_IP = "192.168.1.2"
 # ARIA_IP = "172.16.0.186"
-ARIA_IP = "192.168.0.124"
+ARIA_IP = "172.16.0.186"
 VISUALIZATION = False
-DISPLAY = True
+DISPLAY = False
 
 # --- OPTIMIZATION CONSTANTS ---
 TARGET_WIDTH = 1024
@@ -49,6 +49,7 @@ DEFAULT_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 PALM_SCALE_MULTIPLIER = 4.0
 DETECT_SCALE = 0.5
+MIN_CONFIDENCE = 0.65
 
 # --- VISUALIZER ---
 class Visualizer3D:
@@ -631,8 +632,9 @@ class LinearRectifier:
 
 # --- OPTIMIZATION: ASYNC HAND DETECTOR ---
 class AsyncHandDetector:
-    def __init__(self, mp_hands_instance):
-        self.mp_hands = mp_hands_instance
+    def __init__(self):
+        # We Initialize MediaPipe inside the worker thread to ensure thread safety
+        # and avoid context issues.
         self.lock = threading.Lock()
         
         self.latest_input_img = None
@@ -667,7 +669,20 @@ class AsyncHandDetector:
             return self.latest_results
 
     def _worker(self):
-        print("[AsyncHandDetector] Worker thread started.")
+        print("[AsyncHandDetector] Worker thread started. Initializing MediaPipe...")
+        
+        # Initialize MediaPipe INSIDE the thread
+        import mediapipe as mp
+        mp_hands = mp.solutions.hands
+        hands = mp_hands.Hands(
+            static_image_mode=False,
+            max_num_hands=2,
+            min_detection_confidence=MIN_CONFIDENCE,
+            min_tracking_confidence=MIN_CONFIDENCE,
+            model_complexity=0,
+        )
+        print("[AsyncHandDetector] MediaPipe Initialized.")
+        
         while self.running:
             # Wait for new image
             if self.new_data_event.wait(timeout=0.1):
@@ -682,10 +697,14 @@ class AsyncHandDetector:
                         
                 if img_to_process is not None:
                     # HEAVY OPERATION: Run MediaPipe
-                    results = self.mp_hands.process(img_to_process)
+                    results = hands.process(img_to_process)
                     
                     with self.lock:
                         self.latest_results = results
+                        
+        # Cleanup
+        hands.close()
+        print("[AsyncHandDetector] Worker Stopped.")
 
     
 
@@ -794,12 +813,13 @@ def main():
     model.eval()
 
     # OPTIMIZATION: PyTorch 2.0 Compile
-    if hasattr(torch, "compile"):
-        print("Enable PyTorch 2.0 Compilation...")
-        try:
-            model = torch.compile(model)
-        except Exception as e:
-            print(f"Warning: torch.compile failed: {e}")
+    # DISABLE: Causing excessive recompilation and stalls (Cache limit hit).
+    # if hasattr(torch, "compile"):
+    #     print("Enable PyTorch 2.0 Compilation...")
+    #     try:
+    #         model = torch.compile(model)
+    #     except Exception as e:
+    #         print(f"Warning: torch.compile failed: {e}")
 
 
     # --- WARMUP (CRITICAL STEP) ---
@@ -819,15 +839,9 @@ def main():
             # This call triggers the compilation
             _ = model(dummy_batch)
 
-    print("--> Detector: MediaPipe Hands")
-    mp_hands = mp.solutions.hands
-    hands = mp_hands.Hands(
-        static_image_mode=False,
-        max_num_hands=2,
-        min_detection_confidence=0.3,
-        min_tracking_confidence=0.3,
-        model_complexity=0,
-    )
+    print("--> Detector: MediaPipe Hands (Managed Async)")
+    # mp_hands = mp.solutions.hands
+    # hands = mp_hands.Hands(...) -> MOVED TO ASYNC WORKER
 
     # --- FILTERS ---
     filters_skeleton = {"Left": OneEuroFilter(beta=0.05), "Right": OneEuroFilter(beta=0.05)}
@@ -862,7 +876,7 @@ def main():
     
     # --- OPTIMIZATION INIT ---
     rectifier = LinearRectifier(dst_calib, src_calib)
-    async_detector = AsyncHandDetector(hands)
+    async_detector = AsyncHandDetector()
     async_detector.start()
     head_pose_estimator = HeadPoseEstimator(alpha=0.98)
     udp_sender = UDPSender()
@@ -965,12 +979,23 @@ def main():
                     for idx, hand_landmarks in enumerate(results.multi_hand_landmarks):
 
                         if DISPLAY:
-                            mp.solutions.drawing_utils.draw_landmarks(
-                                debug_frame, hand_landmarks, mp_hands.HAND_CONNECTIONS
-                            )
-                            cv2.imshow("Rectified (Input to AI)", debug_frame)
+                             # Note: mp_hands is not available here anymore as it is inside the thread. 
+                             # We can use mp.solutions.drawing_utils but we need the context.
+                             # Actually we can just import it locally or use a global reference if needed.
+                             import mediapipe as mp
+                             mp.solutions.drawing_utils.draw_landmarks(
+                                 debug_frame, hand_landmarks, mp.solutions.hands.HAND_CONNECTIONS
+                             )
+                             cv2.imshow("Rectified (Input to AI)", debug_frame)
 
-                        mp_label = results.multi_handedness[idx].classification[0].label
+                        mp_classification = results.multi_handedness[idx].classification[0]
+                        mp_label = mp_classification.label
+                        mp_score = mp_classification.score
+                        
+                        # FILTER: Ignore hands with low classification confidence
+                        if mp_score < MIN_CONFIDENCE:
+                            continue
+
                         # Swap because of the 90° rotation you already accounted for
                         label_text = "Right" if mp_label == "Left" else "Left"
 
@@ -1148,7 +1173,6 @@ def main():
                             print(f"Right hand quaternion: {quat_xyzw[0]:.3f}, {quat_xyzw[1]:.3f}, {quat_xyzw[2]:.3f}, {quat_xyzw[3]:.3f}")
 
                         udp_sender.send_data(current_skeleton, current_pos, quat_xyzw, current_mode)
-                        print(f"Sent data with mode: {current_mode}")
                         t7 = time.time()
 
 
@@ -1161,6 +1185,7 @@ def main():
                 report("mediapipe", t4, t5)
                 report("hamba", t5, t6)
                 report("cpu+udp", t6, t7)
+                report("Total", t0, t7)
 
     except KeyboardInterrupt:
         print("\nCtrl+C pressed. Stopping...")
